@@ -66,8 +66,23 @@ start(Partition, Config) ->
                 Value
         end,
 
+    DataDir2 =
+        case DataDir of
+            {random, Dirs} ->
+                {N, _} = random:uniform_s(length(Dirs), erlang:now()),
+                lists:nth(N, Dirs);
+            {spread, Dirs} ->
+                DSize = [case file:list_dir(Dir) of
+                             {ok, Files} -> {length(Files), Dir};
+                             {error, _E} -> {0, Dir}
+                         end || Dir <- Dirs],
+                element(2, hd(lists:keysort(1, DSize)));
+            _ ->
+                DataDir
+        end,
+        
     %% Setup actual bitcask dir for this partition
-    BitcaskRoot = filename:join([DataDir,
+    BitcaskRoot = filename:join([DataDir2,
                                  integer_to_list(Partition)]),
     case filelib:ensure_dir(BitcaskRoot) of
         ok ->
@@ -274,4 +289,21 @@ custom_config_test() ->
     application:set_env(bitcask, data_root, ""),
     riak_kv_backend:standard_test(?MODULE, [{data_root, "test/bitcask-backend"}]).
 
+random_test() ->
+    ?assertCmd("rm -rf test/bitcask-backend1"),
+    ?assertCmd("rm -rf test/bitcask-backend2"),
+    DataDirs = {random, ["test/bitcask-backend1", "test/bitcask-backend2"]},
+    application:set_env(bitcask, data_root, DataDirs),
+    riak_kv_backend:standard_test(?MODULE, []).
+
+spread_config_test() ->
+    ?assertCmd("rm -rf test/bitcask-backend1"),
+    ?assertCmd("rm -rf test/bitcask-backend2"),
+    ?assertCmd("mkdir test/bitcask-backend1"),
+    ?assertCmd("touch test/bitcask-backend1/test"),
+    DataDirs = {spread, ["test/bitcask-backend1", "test/bitcask-backend2"]},
+    application:set_env(bitcask, data_root, ""),
+    riak_kv_backend:standard_test(?MODULE, [{data_root, DataDirs}]),
+    {ok, _Files} = file:list_dir("test/bitcask-backend2").
+    
 -endif.

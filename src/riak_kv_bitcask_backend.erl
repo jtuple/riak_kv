@@ -66,21 +66,31 @@ start(Partition, Config) ->
                 Value
         end,
 
-    DataDir2 =
+    ExistingDir =
         case DataDir of
-            {random, Dirs} ->
+            {_, Roots} ->
+                find_existing_dir(Partition, Roots);
+            _ ->
+                none
+        end,
+
+    DataDir2 =
+        case {ExistingDir, DataDir} of
+            {none, {random, Dirs}} ->
                 {N, _} = random:uniform_s(length(Dirs), erlang:now()),
                 lists:nth(N, Dirs);
-            {spread, Dirs} ->
+            {none, {spread, Dirs}} ->
                 DSize = [case file:list_dir(Dir) of
                              {ok, Files} -> {length(Files), Dir};
                              {error, _E} -> {0, Dir}
                          end || Dir <- Dirs],
                 element(2, hd(lists:keysort(1, DSize)));
+            {none, _} ->
+                DataDir;
             _ ->
-                DataDir
+                ExistingDir
         end,
-        
+
     %% Setup actual bitcask dir for this partition
     BitcaskRoot = filename:join([DataDir2,
                                  integer_to_list(Partition)]),
@@ -244,6 +254,24 @@ key_counts() ->
 %% ===================================================================
 
 %% @private
+%% Searches a list of directories for an existing partition bitcask
+find_existing_dir(Partition, Dirs) ->
+    Find = integer_to_list(Partition),
+    lists:foldl(fun(Dir, Found) ->
+                        case file:list_dir(Dir) of
+                            {ok, Files} ->
+                                case lists:member(Find, Files) of
+                                    true -> Dir;
+                                    false -> Found
+                                end;
+                            _ ->
+                                Found
+                        end
+                end,
+                none,
+                Dirs).
+
+%% @private
 %% Invoke bitcask:status/1 for a given directory
 status(Dir) ->
     Ref = bitcask:open(Dir),
@@ -305,5 +333,28 @@ spread_config_test() ->
     application:set_env(bitcask, data_root, ""),
     riak_kv_backend:standard_test(?MODULE, [{data_root, DataDirs}]),
     {ok, _Files} = file:list_dir("test/bitcask-backend2").
+
+existing_dir_test() ->
+    ?assertCmd("rm -rf test/bitcask-backend1"),
+    ?assertCmd("rm -rf test/bitcask-backend2"),
+    ?assertCmd("rm -rf test/bitcask-backend3"),
+    ?assertCmd("rm -rf test/bitcask-backend4"),
+    Dirs = ["test/bitcask-backend1", "test/bitcask-backend2",
+            "test/bitcask-backend3", "test/bitcask-backend4"],
+    ?assertEqual(none, find_existing_dir(42, Dirs)),
+
+    {ok, BC} = start(42, [{data_root, {random, Dirs}}]),
+    BKey = {<<"a">>, <<"b">>},
+    put(BC, BKey, <<"c">>),
+    stop(BC),
+
+    %% Ensure we always open the same directory
+    [[begin
+          {ok, BC2} = start(42, [{data_root, {Mode, Dirs}}]),
+          ?assertMatch({ok, <<"c">>}, get(BC2, BKey)),
+          stop(BC2)
+      end || _X <- lists:seq(1,20)] || Mode <- [random, spread]],
+
+    ?assert(lists:member(find_existing_dir(42, Dirs), Dirs)).
     
 -endif.

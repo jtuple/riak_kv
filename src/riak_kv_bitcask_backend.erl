@@ -52,7 +52,11 @@
 
 start(Partition, Config) ->
 
-    %% Get the data root directory
+    %% Seed random number generator
+    {_, A2, A3} = erlang:now(),
+    random:seed(Partition, A2, A3),
+
+    %% Get the data root directories
     DataDir =
         case proplists:get_value(data_root, Config) of
             undefined ->
@@ -66,6 +70,7 @@ start(Partition, Config) ->
                 Value
         end,
 
+    %% Check if this partition's bitcask already exists
     ExistingDir =
         case DataDir of
             {_, Roots} ->
@@ -74,33 +79,46 @@ start(Partition, Config) ->
                 none
         end,
 
-    DataDir2 =
+    %% Pick one of the root directories using the given strategy
+    BitcaskRoot = 
         case {ExistingDir, DataDir} of
-            {none, {random, Dirs}} ->
-                {N, _} = random:uniform_s(length(Dirs), erlang:now()),
-                lists:nth(N, Dirs);
-            {none, {spread, Dirs}} ->
-                DSize = [case file:list_dir(Dir) of
-                             {ok, Files} -> {length(Files), Dir};
-                             {error, _E} -> {0, Dir}
-                         end || Dir <- Dirs],
-                element(2, hd(lists:keysort(1, DSize)));
+            {none, {Strategy, Dirs}} ->
+                NDirs = case Strategy of
+                            spread ->
+                                [case file:list_dir(Dir) of
+                                      {ok, Files} -> {length(Files), Dir};
+                                      {error, _E} -> {0, Dir}
+                                 end || Dir <- Dirs];
+                            random ->
+                                [{random:uniform(), Dir} || Dir <- Dirs]
+                        end,
+                lists:foldl(fun({_, Dir}, Chosen) ->
+                                case Chosen of
+                                    none ->
+                                        TryDir = filename:join([Dir, integer_to_list(Partition)]),
+                                        case filelib:ensure_dir(TryDir) of
+                                            ok ->
+                                                TryDir;
+                                            {error, Reason} ->
+                                                error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n", [TryDir, Reason]),
+                                                Chosen
+                                        end;
+                                    _ ->
+                                        Chosen
+                                end
+                            end, none, lists:keysort(1, NDirs));
             {none, _} ->
                 DataDir;
             _ ->
                 ExistingDir
         end,
 
-    %% Setup actual bitcask dir for this partition
-    BitcaskRoot = filename:join([DataDir2,
-                                 integer_to_list(Partition)]),
-    case filelib:ensure_dir(BitcaskRoot) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n",
-                                   [BitcaskRoot, Reason]),
-            riak:stop("riak_kv_bitcask_backend failed to start.")
+    %% Stop if we failed to find or create a directory
+    case BitcaskRoot of
+        none ->
+            riak:stop("riak_kv_bitcask_backend failed to start.");
+        _ ->
+            ok
     end,
 
     BitcaskOpts = [{read_write, true}|Config],

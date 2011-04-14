@@ -51,10 +51,6 @@
 -define(MERGE_CHECK_INTERVAL, timer:minutes(3)).
 
 start(Partition, Config) ->
-    %% Seed random number generator
-    {_, A2, A3} = erlang:now(),
-    random:seed(Partition, A2, A3),
-
     %% Get the data root directories
     DataRootConfig =
         case proplists:get_value(data_root, Config) of
@@ -80,34 +76,21 @@ start(Partition, Config) ->
                 none
         end,
 
-    %% Pick one of the root directories using the given strategy
-    DataDir = 
+    %% Pick one of the root directories using the given strategy, or use existing if it was found
+    DataDir =
         case {ExistingDir, DataRootConfig} of
             {none, {Strategy, Dirs}} ->
-                NDirs = case Strategy of
-                            spread ->
-                                [case file:list_dir(Dir) of
-                                      {ok, Files} -> {length(Files), Dir};
-                                      {error, _E} -> {0, Dir}
-                                 end || Dir <- Dirs];
-                            random ->
-                                [{random:uniform(), Dir} || Dir <- Dirs]
-                        end,
-                lists:foldl(fun({_, Dir}, Chosen) ->
-                                case Chosen of
-                                    none ->
-                                        TryDir = filename:join([Dir, PartitionFile]),
-                                        case filelib:ensure_dir(TryDir) of
-                                            ok ->
-                                                Dir;
-                                            {error, Reason} ->
-                                                error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n", [TryDir, Reason]),
-                                                Chosen
-                                        end;
-                                    _ ->
-                                        Chosen
-                                end
-                            end, none, lists:keysort(1, NDirs));
+                RandomizedDirs = reorder_list(Dirs, [crypto:rand_uniform(0, 1000 * length(Dirs)) || _ <- Dirs]),
+                OrderedDirs = case Strategy of
+                        random -> RandomizedDirs;
+                        spread ->
+                            NewOrdering = [case file:list_dir(Dir) of
+                                    {ok, Files} -> length(Files);
+                                    _ -> 0
+                                end || Dir <- RandomizedDirs],
+                            reorder_list(RandomizedDirs, NewOrdering)
+                    end,
+                pick_bitcask_root(OrderedDirs, PartitionFile);
             {none, _} ->
                 DataRootConfig;
             _ ->
@@ -273,6 +256,27 @@ key_counts() ->
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
+
+%% @private
+%% Pick a bitcask root from the list in order of preference
+pick_bitcask_root([], _) ->
+    none;
+pick_bitcask_root([Dir|T], PartitionFile) ->
+    TryDir = filename:join([Dir, PartitionFile]),
+    case filelib:ensure_dir(TryDir) of
+        ok ->
+            Dir;
+        {error, Reason} ->
+            error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n", [TryDir, Reason]),
+            pick_bitcask_root(T, PartitionFile)
+    end.
+
+%% @private
+%% Reorder the given list in the sorted order of the second argument
+reorder_list(List, Ordering) ->
+    Zipped = lists:zip(List, Ordering),
+    Ordered = lists:keysort(2, Zipped),
+    lists:map(fun({Elem, _}) -> Elem end, Ordered).
 
 %% @private
 %% Searches a list of directories for an existing partition bitcask

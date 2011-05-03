@@ -65,13 +65,13 @@ start(Partition, Config) ->
                 Value
         end,
 
-    PartitionFile = integer_to_list(Partition),
+    PartitionDir = integer_to_list(Partition),
 
     %% Check if this partition's bitcask already exists
     ExistingDir =
         case DataRootConfig of
             {_, Roots} ->
-                find_existing_dir(PartitionFile, Roots);
+                find_existing_dir(PartitionDir, Roots);
             _ ->
                 none
         end,
@@ -90,14 +90,14 @@ start(Partition, Config) ->
                                 end || Dir <- RandomizedDirs],
                             reorder_list(RandomizedDirs, NewOrdering)
                     end,
-                pick_bitcask_root(OrderedDirs, PartitionFile);
+                pick_bitcask_root(PartitionDir, OrderedDirs);
             {none, _} ->
                 DataRootConfig;
             _ ->
                 ExistingDir
         end,
 
-    BitcaskRoot = filename:join([DataDir, PartitionFile]),
+    BitcaskRoot = filename:join([DataDir, PartitionDir]),
 
     %% Stop if we failed to find or create a directory
     case BitcaskRoot of
@@ -259,16 +259,16 @@ key_counts() ->
 
 %% @private
 %% Pick a bitcask root from the list in order of preference
-pick_bitcask_root([], _) ->
+pick_bitcask_root(_, []) ->
     none;
-pick_bitcask_root([Dir|T], PartitionFile) ->
-    TryDir = filename:join([Dir, PartitionFile]),
+pick_bitcask_root(PartitionDir, [Dir|Rest]) ->
+    TryDir = filename:join([Dir, PartitionDir]),
     case filelib:ensure_dir(TryDir) of
         ok ->
             Dir;
         {error, Reason} ->
             error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n", [TryDir, Reason]),
-            pick_bitcask_root(T, PartitionFile)
+            pick_bitcask_root(PartitionDir, Rest)
     end.
 
 %% @private
@@ -279,21 +279,19 @@ reorder_list(List, Ordering) ->
     lists:map(fun({Elem, _}) -> Elem end, Ordered).
 
 %% @private
-%% Searches a list of directories for an existing partition bitcask
-find_existing_dir(Find, Dirs) ->
-    lists:foldl(fun(Dir, Found) ->
-                        case file:list_dir(Dir) of
-                            {ok, Files} ->
-                                case lists:member(Find, Files) of
-                                    true -> Dir;
-                                    false -> Found
-                                end;
-                            _ ->
-                                Found
-                        end
-                end,
-                none,
-                Dirs).
+%% Search a list of directories for an existing partition bitcask
+find_existing_dir(_, []) ->
+    none;
+find_existing_dir(Find, [Dir|Rest]) ->
+    case file:list_dir(Dir) of
+        {ok, Files} ->
+            case lists:member(Find, Files) of
+                true -> Dir;
+                false -> find_existing_dir(Find, Rest)
+            end;
+        _ ->
+            find_existing_dir(Find, Rest)
+    end.
 
 %% @private
 %% Invoke bitcask:status/1 for a given directory

@@ -51,9 +51,8 @@
 -define(MERGE_CHECK_INTERVAL, timer:minutes(3)).
 
 start(Partition, Config) ->
-
-    %% Get the data root directory
-    DataDir =
+    %% Get the data root directories
+    DataRootConfig =
         case proplists:get_value(data_root, Config) of
             undefined ->
                 case application:get_env(bitcask, data_root) of
@@ -66,41 +65,46 @@ start(Partition, Config) ->
                 Value
         end,
 
+    PartitionDir = integer_to_list(Partition),
+
+    %% Check if this partition's bitcask already exists
     ExistingDir =
-        case DataDir of
+        case DataRootConfig of
             {_, Roots} ->
-                find_existing_dir(Partition, Roots);
+                find_existing_dir(PartitionDir, Roots);
             _ ->
                 none
         end,
 
-    DataDir2 =
-        case {ExistingDir, DataDir} of
-            {none, {random, Dirs}} ->
-                {N, _} = random:uniform_s(length(Dirs), erlang:now()),
-                lists:nth(N, Dirs);
-            {none, {spread, Dirs}} ->
-                DSize = [case file:list_dir(Dir) of
-                             {ok, Files} -> {length(Files), Dir};
-                             {error, _E} -> {0, Dir}
-                         end || Dir <- Dirs],
-                element(2, hd(lists:keysort(1, DSize)));
+    %% Pick one of the root directories using the given strategy, or use existing if it was found
+    DataDir =
+        case {ExistingDir, DataRootConfig} of
+            {none, {Strategy, Dirs}} ->
+                RandomizedDirs = reorder_list(Dirs, [crypto:rand_uniform(0, 1000 * length(Dirs)) || _ <- Dirs]),
+                OrderedDirs = case Strategy of
+                        random -> RandomizedDirs;
+                        spread ->
+                            NewOrdering = [case file:list_dir(Dir) of
+                                    {ok, Files} -> length(Files);
+                                    _ -> 0
+                                end || Dir <- RandomizedDirs],
+                            reorder_list(RandomizedDirs, NewOrdering)
+                    end,
+                pick_bitcask_root(PartitionDir, OrderedDirs);
             {none, _} ->
-                DataDir;
+                DataRootConfig;
             _ ->
                 ExistingDir
         end,
 
-    %% Setup actual bitcask dir for this partition
-    BitcaskRoot = filename:join([DataDir2,
-                                 integer_to_list(Partition)]),
-    case filelib:ensure_dir(BitcaskRoot) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n",
-                                   [BitcaskRoot, Reason]),
-            riak:stop("riak_kv_bitcask_backend failed to start.")
+    BitcaskRoot = filename:join([DataDir, PartitionDir]),
+
+    %% Stop if we failed to find or create a directory
+    case BitcaskRoot of
+        none ->
+            riak:stop("riak_kv_bitcask_backend failed to start.");
+        _ ->
+            ok
     end,
 
     BitcaskOpts = [{read_write, true}|Config],
@@ -254,22 +258,40 @@ key_counts() ->
 %% ===================================================================
 
 %% @private
-%% Searches a list of directories for an existing partition bitcask
-find_existing_dir(Partition, Dirs) ->
-    Find = integer_to_list(Partition),
-    lists:foldl(fun(Dir, Found) ->
-                        case file:list_dir(Dir) of
-                            {ok, Files} ->
-                                case lists:member(Find, Files) of
-                                    true -> Dir;
-                                    false -> Found
-                                end;
-                            _ ->
-                                Found
-                        end
-                end,
-                none,
-                Dirs).
+%% Pick a bitcask root from the list in order of preference
+pick_bitcask_root(_, []) ->
+    none;
+pick_bitcask_root(PartitionDir, [Dir|Rest]) ->
+    TryDir = filename:join([Dir, PartitionDir]),
+    case filelib:ensure_dir(TryDir) of
+        ok ->
+            Dir;
+        {error, Reason} ->
+            error_logger:error_msg("Failed to create bitcask dir ~s: ~p\n", [TryDir, Reason]),
+            pick_bitcask_root(PartitionDir, Rest)
+    end.
+
+%% @private
+%% Reorder the given list in the sorted order of the second argument
+reorder_list(List, Ordering) ->
+    Zipped = lists:zip(List, Ordering),
+    Ordered = lists:keysort(2, Zipped),
+    lists:map(fun({Elem, _}) -> Elem end, Ordered).
+
+%% @private
+%% Search a list of directories for an existing partition bitcask
+find_existing_dir(_, []) ->
+    none;
+find_existing_dir(Find, [Dir|Rest]) ->
+    case file:list_dir(Dir) of
+        {ok, Files} ->
+            case lists:member(Find, Files) of
+                true -> Dir;
+                false -> find_existing_dir(Find, Rest)
+            end;
+        _ ->
+            find_existing_dir(Find, Rest)
+    end.
 
 %% @private
 %% Invoke bitcask:status/1 for a given directory
@@ -341,7 +363,7 @@ existing_dir_test() ->
     ?assertCmd("rm -rf test/bitcask-backend4"),
     Dirs = ["test/bitcask-backend1", "test/bitcask-backend2",
             "test/bitcask-backend3", "test/bitcask-backend4"],
-    ?assertEqual(none, find_existing_dir(42, Dirs)),
+    ?assertEqual(none, find_existing_dir("42", Dirs)),
 
     {ok, BC} = start(42, [{data_root, {random, Dirs}}]),
     BKey = {<<"a">>, <<"b">>},
@@ -355,6 +377,6 @@ existing_dir_test() ->
           stop(BC2)
       end || _X <- lists:seq(1,20)] || Mode <- [random, spread]],
 
-    ?assert(lists:member(find_existing_dir(42, Dirs), Dirs)).
+    ?assert(lists:member(find_existing_dir("42", Dirs), Dirs)).
     
 -endif.
